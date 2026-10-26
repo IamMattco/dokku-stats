@@ -1,0 +1,4 @@
+[plugin]
+description = "Container resource usage (CPU, memory, disk) for Dokku UI"
+version = "0.1.0"
+[plugin.config]

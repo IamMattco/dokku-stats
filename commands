@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Resource usage report consumed by Dokku UI (Dokku::StatsService).
+# Output is pipe-separated, one record per line, first field is the record type:
+#   host|<cpus>|<load1>|<mem_total>|<mem_used>|<disk_total>|<disk_used>
+#   container|<id>|<name>|<image>|<state>|<status>|<size>|<app>|<process_type>
+#   usage|<id>|<cpu%>|<mem_usage>|<mem%>|<net_io>|<block_io>|<pids>
+#   disk|<app>|<repo_bytes>|<storage_bytes>
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+
+DOCKER="${DOCKER_BIN:-docker}"
+STORAGE_ROOT="${DOKKU_LIB_ROOT:-/var/lib/dokku}/data/storage"
+
+stats_host() {
+  local cpus load mem disk
+  cpus="$(nproc 2>/dev/null || echo 0)"
+  load="$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)"
+  mem="$(free -b 2>/dev/null | awk '/^Mem:/ {print $2 "|" ($2 - $7)}')"
+  disk="$(df -B1 --output=size,used /var/lib/docker 2>/dev/null | awk 'NR==2 {print $1 "|" $2}')"
+  [[ -z "$disk" ]] && disk="$(df -B1 --output=size,used / 2>/dev/null | awk 'NR==2 {print $1 "|" $2}')"
+  echo "host|$cpus|$load|${mem:-0|0}|${disk:-0|0}"
+}
+
+stats_containers() {
+  # without an app, list every container so databases and other services show up too
+  local filter=()
+  [[ -n "$1" ]] && filter=(--filter "label=com.dokku.app-name=$1")
+
+  "$DOCKER" ps -a -s "${filter[@]}" \
+    --format 'container|{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.Status}}|{{.Size}}|{{.Label "com.dokku.app-name"}}|{{.Label "com.dokku.process-type"}}'
+}
+
+stats_usage() {
+  local ids
+  if [[ -n "$1" ]]; then
+    ids="$("$DOCKER" ps -q --filter "label=com.dokku.app-name=$1")"
+    [[ -z "$ids" ]] && return 0
+  fi
+
+  # shellcheck disable=SC2086
+  "$DOCKER" stats --no-stream $ids \
+    --format 'usage|{{.ID}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.BlockIO}}|{{.PIDs}}'
+}
+
+stats_disk() {
+  local app="$1" repo storage cids
+  repo="$(du -sb "$DOKKU_ROOT/$app" 2>/dev/null | cut -f1 || true)"
+
+  storage=0
+  cids="$("$DOCKER" ps -aq --filter "label=com.dokku.app-name=$app")"
+  if [[ -n "$cids" ]]; then
+    # only bind mounts under the dokku storage root, never arbitrary host paths
+    # shellcheck disable=SC2086
+    storage="$("$DOCKER" inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' $cids 2>/dev/null |
+      grep "^$STORAGE_ROOT/" | sort -u |
+      xargs -r du -sbc 2>/dev/null | awk '/\ttotal$/ {print $1}' || true)"
+  fi
+
+  echo "disk|$app|${repo:-0}|${storage:-0}"
+}
+
+cmd-stats-report() {
+  declare desc="print resource usage of all containers, or of a single app"
+  declare APP="$2"
+
+  if [[ -n "$APP" ]]; then
+    verify_app_name "$APP"
+  fi
+
+  stats_host
+  stats_containers "$APP"
+  stats_usage "$APP"
+
+  if [[ -n "$APP" ]]; then
+    stats_disk "$APP"
+  else
+    for app in $(dokku_apps 2>/dev/null || true); do
+      stats_disk "$app"
+    done
+  fi
+}
+
+case "$1" in
+  stats:report)
+    cmd-stats-report "$@"
+    ;;
+
+  help | stats:help)
+    cat <<help_content
+    stats:report [<app>], Print resource usage of all containers, or of a single app
+help_content
+    ;;
+
+  *)
+    exit "$DOKKU_NOT_IMPLEMENTED_EXIT"
+    ;;
+esac
