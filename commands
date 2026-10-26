@@ -5,6 +5,10 @@
 #   container|<id>|<name>|<image>|<state>|<status>|<size>|<app>|<process_type>
 #   usage|<id>|<cpu%>|<mem_usage>|<mem%>|<net_io>|<block_io>|<pids>
 #   disk|<app>|<repo_bytes>|<storage_bytes>
+#
+# stats:df       df|<type>|<total>|<active>|<size>|<reclaimable>   (docker system df)
+# stats:services service|<plugin>|<name>|<container_id>|<data_bytes>
+# stats:prune <build-cache|images>   removes docker build cache or dangling images
 set -eo pipefail
 [[ $DOKKU_TRACE ]] && set -x
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
@@ -81,14 +85,71 @@ cmd-stats-report() {
   fi
 }
 
+cmd-stats-df() {
+  declare desc="print docker disk usage by type"
+  "$DOCKER" system df --format 'df|{{.Type}}|{{.TotalCount}}|{{.Active}}|{{.Size}}|{{.Reclaimable}}'
+}
+
+cmd-stats-services() {
+  declare desc="print data size of dokku service containers (postgres, mysql, redis...)"
+  local container id name plugin service dest bytes
+
+  "$DOCKER" ps --filter "name=^dokku\." --format '{{.ID}} {{.Names}}' | while read -r id name; do
+    # container names look like dokku.<plugin>.<service>
+    plugin="$(echo "$name" | cut -d. -f2)"
+    service="$(echo "$name" | cut -d. -f3-)"
+    [[ -z "$plugin" || -z "$service" ]] && continue
+
+    bytes=0
+    for dest in $("$DOCKER" inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' "$id" 2>/dev/null); do
+      # measured inside the container: data dirs on the host are owned by the service user
+      size="$("$DOCKER" exec "$id" du -sb "$dest" 2>/dev/null | cut -f1 || true)"
+      bytes=$((bytes + ${size:-0}))
+    done
+
+    echo "service|$plugin|$service|$id|$bytes"
+  done
+}
+
+cmd-stats-prune() {
+  declare desc="remove docker build cache or dangling images"
+  case "$2" in
+    build-cache)
+      "$DOCKER" builder prune -af
+      ;;
+    images)
+      # dangling only: images of stopped apps must survive so ps:start keeps working
+      "$DOCKER" image prune -f
+      ;;
+    *)
+      dokku_log_fail "Usage: dokku stats:prune <build-cache|images>"
+      ;;
+  esac
+}
+
 case "$1" in
   stats:report)
     cmd-stats-report "$@"
     ;;
 
+  stats:df)
+    cmd-stats-df "$@"
+    ;;
+
+  stats:services)
+    cmd-stats-services "$@"
+    ;;
+
+  stats:prune)
+    cmd-stats-prune "$@"
+    ;;
+
   help | stats:help)
     cat <<help_content
     stats:report [<app>], Print resource usage of all containers, or of a single app
+    stats:df, Print docker disk usage by type
+    stats:services, Print data size of service containers
+    stats:prune <build-cache|images>, Remove docker build cache or dangling images
 help_content
     ;;
 
